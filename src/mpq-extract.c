@@ -108,7 +108,7 @@ void get_listfile(mpq_archive_s *mpq_archive, unsigned int total_files) {
 		NOTICE("MPQ has no listfile\n"); /* unlikely but ya never know */
 	}
 	else {
-		libmpq__file_unpacked_size(mpq_archive, listfile_number, &listfile_size);
+		libmpq__file_size_unpacked(mpq_archive, listfile_number, &listfile_size);
 		list = malloc(listfile_size);
 		libmpq__file_read(mpq_archive, listfile_number, list, listfile_size, NULL);
 
