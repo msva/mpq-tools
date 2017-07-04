@@ -20,6 +20,10 @@
  *  $Id: mpq-extract.c,v 1.18 2004/02/12 00:39:17 mbroemme Exp $
  */
 
+/*
+ *	listfile support added by Gavin Massey on 16/8/2010
+*/
+
 /* mpq-tools configuration includes. */
 #include "config.h"
 
@@ -31,6 +35,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+
+/* needed to create directories */
+#include <sys/stat.h>
+#include <errno.h>
 
 /* libmpq includes. */
 #include <mpq.h>
@@ -47,6 +55,114 @@
 #else
 #define OFFTSTR "li"
 #endif
+
+typedef struct listfile_s
+{
+	unsigned int num_entries;
+	char **entries; /* entries[file_number] PATH_MAX is string size */
+	int is_loaded;
+} listfile_s;
+
+/* yeah, it's a global, sue me! */
+listfile_s listfile;
+
+/* convert Windows paths to *nix */
+void convert_path(char *filename) {
+	int i;
+	for(i = 0; i < strlen(filename); i++)
+		if(filename[i] == '\\')
+			filename[i] = '/';
+}
+/* create nested dirs from path */
+int create_dirs(int fd, char *path, mode_t modes) {
+	char curr_path[PATH_MAX] = {0,};
+	char *start = strchr(path, '/');
+	int res = 0;
+	while(start) {
+		memcpy(curr_path, path, (start-path));
+		if(mkdirat(fd, (const char *)curr_path, modes) != 0) {
+			res = errno;
+			if(res == EACCES) {
+				printf("error: not allowed to create dir %s\n", curr_path);
+				return EACCES;
+			}
+			else if(res == ENOTDIR) {
+				printf("error: something majorly bad happened\n");
+				return ENOTDIR;
+			}
+		}
+		start = strchr(start+1, '/');
+	}
+	return 0;
+}
+
+/* read and create listfile structure */
+void get_listfile(mpq_archive_s *mpq_archive, unsigned int total_files) {
+	off_t listfile_size = 0;
+	uint32_t listfile_number = 0;
+	uint8_t *list;
+	int i = 0;
+	char *file;
+	/* check if we can use the listfile */
+	if(libmpq__file_number(mpq_archive, "(listfile)", &listfile_number) != 0) {
+		NOTICE("MPQ has no listfile\n"); /* unlikely but ya never know */
+	}
+	else {
+		libmpq__file_unpacked_size(mpq_archive, listfile_number, &listfile_size);
+		list = malloc(listfile_size);
+		libmpq__file_read(mpq_archive, listfile_number, list, listfile_size, NULL);
+
+		listfile.num_entries = total_files;
+		listfile.entries = calloc(total_files, sizeof(char*));
+
+		file = strtok((char*)list, "\r\n");
+		for(i = 0; i < total_files; i++)
+		{
+			/* must check for this first! */
+			if(i == listfile_number) {
+				listfile.entries[i] = calloc(1, PATH_MAX); /* so it's automatically null terminated */
+				memcpy(listfile.entries[i], "listfile.txt", strlen("listfile.txt"));
+				i++;
+			}
+
+			if(!file)
+				break;
+
+			listfile.entries[i] = calloc(1, PATH_MAX); /* so it's automatically null terminated */
+			if(strlen(file) < PATH_MAX)
+				memcpy(listfile.entries[i], file, strlen(file));
+			else
+				memcpy(listfile.entries[i], file, PATH_MAX);
+
+			file = strtok(NULL, "\r\n");
+		}
+		/* in case it never gets it like with d2sfx.mpq and d2exp.mpq */
+		if(!listfile.entries[listfile_number]) {
+			listfile.entries[listfile_number] = calloc(1, PATH_MAX);
+			memcpy(listfile.entries[listfile_number], "listfile.txt", strlen("listfile.txt"));
+		}
+
+		if(i != total_files)
+			NOTICE("error: listfile incomplete\n");
+
+		free(list);
+		listfile.is_loaded = 1;
+	}
+}
+
+void destroy_listfile()
+{
+	if(!listfile.is_loaded)
+		return;
+
+	int i;
+	for(i = 0; i < listfile.num_entries; i++)
+		free(listfile.entries[i]);
+
+	free(listfile.entries);
+	listfile.num_entries = 0;
+	listfile.is_loaded = 0;
+}
 
 /* this function show the usage. */
 int mpq_extract__usage(char *program_name) {
@@ -85,6 +201,14 @@ int mpq_extract__version(char *program_name) {
  * listfile support is added. */
 int32_t libmpq__file_name(mpq_archive_s *mpq_archive, uint32_t file_number, char *filename, size_t filename_size) {
 
+	memset(filename, 0, PATH_MAX);
+	if(listfile.is_loaded) {
+		if(listfile.entries[file_number]) {
+			memcpy(filename, listfile.entries[file_number], PATH_MAX);
+			return PATH_MAX;
+		}
+	}
+
 	int32_t result = 0;
 
 	if ((result = snprintf(filename, filename_size, "file%06i.xxx", file_number)) < 0) {
@@ -106,8 +230,8 @@ int mpq_extract__list(char *mpq_filename, unsigned int file_number, unsigned int
 	unsigned int imploded    = 0;
 	unsigned int i;
 	static char filename[PATH_MAX];
-	mpq_archive_s *mpq_archive;
 
+	mpq_archive_s *mpq_archive;
 	/* open the mpq-archive. */
 	if ((result = libmpq__archive_open(&mpq_archive, mpq_filename, -1)) < 0) {
 
@@ -117,6 +241,7 @@ int mpq_extract__list(char *mpq_filename, unsigned int file_number, unsigned int
 
 	/* fetch number of files. */
 	libmpq__archive_files(mpq_archive, &total_files);
+	get_listfile(mpq_archive, total_files);
 
 	/* check if we should process all files. */
 	if (file_number != -1) {
@@ -150,7 +275,6 @@ int mpq_extract__list(char *mpq_filename, unsigned int file_number, unsigned int
 		NOTICE("file encrypted:			%s\n", encrypted ? "yes" : "no");
 		NOTICE("file name:			%s\n", filename);
 	} else {
-
 		/* show header. */
 		NOTICE("number   ucmp. size   cmp. size   ratio   cmp   imp   enc   filename\n");
 		NOTICE("------   ----------   ---------   -----   ---   ---   ---   --------\n");
@@ -171,6 +295,7 @@ int mpq_extract__list(char *mpq_filename, unsigned int file_number, unsigned int
 			libmpq__file_encrypted(mpq_archive, i, &encrypted);
 			libmpq__file_compressed(mpq_archive, i, &compressed);
 			libmpq__file_imploded(mpq_archive, i, &imploded);
+
 			libmpq__file_name(mpq_archive, i, filename, PATH_MAX);
 
 			/* show file information. */
@@ -203,7 +328,7 @@ int mpq_extract__list(char *mpq_filename, unsigned int file_number, unsigned int
 			(100 - fabs(((float)size_packed / (float)size_unpacked * 100))),
 			mpq_filename);
 	}
-
+	destroy_listfile();
 	/* always close file descriptor, file could be opened also if it is no valid mpq archive. */
 	libmpq__archive_close(mpq_archive);
 
@@ -266,6 +391,11 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 		/* something on open archive failed. */
 		return result;
 	}
+	/* fetch number of files. */
+	libmpq__archive_files(mpq_archive, &total_files);
+
+	/* create listfile structure */
+	get_listfile(mpq_archive, total_files);
 
 	/* check if we should process all files. */
 	if (file_number != -1) {
@@ -278,10 +408,16 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 			/* filename was not found. */
 			return LIBMPQ_ERROR_EXIST;
 		}
+		convert_path(filename);
+
+		if(create_dirs(AT_FDCWD, filename, S_IRWXU | S_IRWXG | S_IRWXO) != 0) {
+			destroy_listfile();
+			return LIBMPQ_ERROR_OPEN; /* might as well be */
+		}
 
 		/* open file for writing. */
 		if ((fp = fopen(filename, "wb")) == NULL) {
-
+			destroy_listfile();
 			/* open file failed. */
 			return LIBMPQ_ERROR_OPEN;
 		}
@@ -295,7 +431,7 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 				/* close file failed. */
 				return LIBMPQ_ERROR_CLOSE;
 			}
-
+			destroy_listfile();
 			/* always close file descriptor, file could be opened also if it is no valid mpq archive. */
 			libmpq__archive_close(mpq_archive);
 
@@ -311,9 +447,6 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 		}
 	} else {
 
-		/* fetch number of files. */
-		libmpq__archive_files(mpq_archive, &total_files);
-
 		/* loop through all files. */
 		for (i = 0; i < total_files; i++) {
 
@@ -325,6 +458,13 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 
 				/* filename was not found. */
 				return LIBMPQ_ERROR_EXIST;
+			}
+
+			convert_path(filename);
+
+			if(create_dirs(AT_FDCWD, filename, S_IRWXU | S_IRWXG | S_IRWXO) != 0) {
+				destroy_listfile();
+				return LIBMPQ_ERROR_OPEN; /* might as well be */
 			}
 
 			/* open file for writing. */
@@ -343,7 +483,7 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 					/* close file failed. */
 					return LIBMPQ_ERROR_CLOSE;
 				}
-
+				destroy_listfile();
 				/* always close file descriptor, file could be opened also if it is no valid mpq archive. */
 				libmpq__archive_close(mpq_archive);
 
@@ -360,6 +500,7 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 		}
 	}
 
+	destroy_listfile();
 	/* always close file descriptor, file could be opened also if it is no valid mpq archive. */
 	libmpq__archive_close(mpq_archive);
 
@@ -369,7 +510,6 @@ int mpq_extract__extract(char *mpq_filename, unsigned int file_number) {
 
 /* the main function starts here. */
 int main(int argc, char **argv) {
-
 	/* common variables for the command line. */
 	int result;
 	int opt;
